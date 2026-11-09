@@ -25,6 +25,9 @@ DATA = ROOT / "data"
 CACHE = DATA / "limits.json"
 CLAUDE_CACHE = DATA / "claude-usage.json"
 MODELS_FILE = DATA / "known-models.json"
+SETTINGS = DATA / "settings.json"
+HELLO_STATE = DATA / "hello.json"
+HELLO_LOG = DATA / "hello-log.jsonl"
 LOCK = DATA / "refreshing"
 LOW_THRESHOLD, RESET_THRESHOLD, CACHE_MINUTES = 10, 30, 30
 SOURCES = (("claude", "Claude"), ("codex", "Codex"), ("agy", "Antigravity"))
@@ -102,9 +105,13 @@ def limit(source, name, window, remaining, reset, timestamp):
 
 
 def run_agy(args, timeout):
+    hello = (isinstance(args, list) and len(args) == 8
+             and args[:3] == ["-p", "hello", "--model"]
+             and isinstance(args[3], str) and bool(args[3])
+             and args[4:] == ["--output-format", "json", "--print-timeout", "60s"])
     if args != ["models"] and args != [
-            "-p", "/usage", "--output-format", "json", "--print-timeout", "60s"]:
-        raise ValueError("Only agy usage and model listing are allowed")
+            "-p", "/usage", "--output-format", "json", "--print-timeout", "60s"] and not hello:
+        raise ValueError("Only agy usage, model listing, and the fixed hello prompt are allowed")
     if AGY is None:
         raise FileNotFoundError("agy is not installed")
     process = subprocess.Popen([AGY] + args, cwd=str(HOME), stdin=subprocess.DEVNULL,
@@ -381,6 +388,98 @@ def release_lock():
         _lock = None
 
 
+def auto_hello_enabled():
+    try:
+        settings = read_json(SETTINGS)
+        return isinstance(settings, dict) and settings.get("auto_hello") is True
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        return False
+
+
+def weekly_not_started(x, previous):
+    try:
+        if not all(y["source"] == "Antigravity" and y["window"] == "weekly" and
+                   number(y["remaining"], 0, 100) == 100 for y in (x, previous)):
+            return False
+        if x["name"] != previous["name"]:
+            return False
+        interval = number(x["data_time"]) - number(previous["data_time"])
+        shift = number(x["reset"]) - number(previous["reset"])
+        # A fixed reset is not a sliding counter, even within the tolerance.
+        return interval >= 60 and shift > 0 and abs(shift - interval) < 300
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def hello_model(group, data):
+    preferences = {"Gemini Models": ("gemini-3.8-flash-low", ("flash",)),
+                   "Gemini 4 Argon": ("gemini-4-argon-low", ("argon",)),
+                   "Claude and GPT models": ("gpt-oss-120b-medium", ("gpt-oss", "sonnet"))}
+    if group not in preferences or "agy" not in data["successful"]:
+        return None
+    ids = [k[4:] for k in data["models"] if k.startswith("agy:")]
+    preferred, keywords = preferences[group]
+    if preferred in ids:
+        return preferred
+    for keyword in keywords:
+        candidates = [k for k in ids if keyword in k.lower()]
+        if candidates:
+            return min(candidates, key=lambda k: ("low" not in k.lower(), k))
+    return None
+
+
+def send_hello(limits, model_data, previous_limits):
+    if not auto_hello_enabled():
+        return
+    state = safe(read_json, HELLO_STATE)
+    if not isinstance(state, dict):
+        state = {}
+    state = {k: v for k, v in state.items()
+             if isinstance(v, (float, int)) and not isinstance(v, bool) and math.isfinite(v)}
+    for x in limits:
+        group, timestamp = x["name"], time.time()
+        if (not any(weekly_not_started(x, previous) for previous in previous_limits)
+                or timestamp - state.get(group, 0) < 21600):
+            continue
+        model = hello_model(group, model_data)
+        result = "no model"
+        if model:
+            try:
+                run_agy(["-p", "hello", "--model", model,
+                         "--output-format", "json", "--print-timeout", "60s"], 90)
+                result = "sent"
+                state[group] = time.time()
+                atomic_json(HELLO_STATE, state)
+            except Exception as error:
+                result = f"error: {type(error).__name__}"
+        HELLO_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with HELLO_LOG.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(dict(time=timestamp, group=group, model=model, result=result),
+                                  ensure_ascii=False) + "\n")
+
+
+def last_hello():
+    if not auto_hello_enabled():
+        return None
+    try:
+        for line in reversed(tail(HELLO_LOG)):
+            try:
+                x = json.loads(line)
+                number(x["time"])
+                text(x["group"])
+                text(x["result"])
+                if x["model"] is not None:
+                    text(x["model"])
+                return dict(time=x["time"], group=text(x["group"]),
+                            model=text(x["model"]) if x["model"] is not None else None,
+                            result=text(x["result"]))
+            except (ValueError, TypeError, KeyError):
+                continue
+    except (OSError, UnicodeError):
+        pass
+    return None
+
+
 def cached_source(section, source):
     if not isinstance(section, dict):
         raise ValueError("Invalid cached source schema")
@@ -447,8 +546,17 @@ def collect():
                                ("claude", claude_usage)):
             result = safe(operation)
             data[key] = keep_last_good(result, old.get(key, {}))
+            if key == "agy":
+                fresh_agy = "error" not in result
         data["model_sources"] = models()
         data["models_status"] = safe(model_status, data["model_sources"])
+        if auto_hello_enabled() and fresh_agy:
+            previous_agy = old.get("agy", {})
+            previous_limits = (previous_agy.get("limits", [])
+                               if not any(k in previous_agy for k in ("error", "last_error"))
+                               else [])
+            safe(send_hello, data["agy"].get("limits", []),
+                 data["model_sources"], previous_limits)
         data["timestamp"] = time.time()
         atomic_json(CACHE, data)
         return data
@@ -604,8 +712,9 @@ def menubar(data):
 def render_text(data, from_cache=False):
     age = format_duration(time.time() - data.get("timestamp", time.time()))
     lines = [f"Data: {'cache, ' + age + ' ago' if from_cache else 'now'}"]
+    hello = last_hello()
     for k, name in SOURCES:
-        if not data.get(k):
+        if not data.get(k) and not (k == "agy" and hello):
             continue
         lines.append(name + ":")
         for x in data.get(k, {}).get("limits", []):
@@ -613,6 +722,9 @@ def render_text(data, from_cache=False):
                      f"{x['remaining']}% · {format_date(x['reset'])} "
                      f"({format_duration(x['reset'] - time.time())})")
             lines.append(f"  {x['name']} {x['window']}: {detail}")
+        if k == "agy" and hello:
+            lines.append(f"Last automatic message: {hello['group']} {format_date(hello['time'])} "
+                         f"({hello['model']}, {hello['result']})")
     status = data.get("models_status", {})
     total = len(data.get("model_sources", {}).get("models", {}))
     lines.append(f"Models: {total}")
@@ -631,7 +743,7 @@ def render_text(data, from_cache=False):
 
 
 def json_data(data):
-    result = dict(data, warnings=warnings(data))
+    result = dict(data, warnings=warnings(data), last_hello=last_hello())
     for k, _ in SOURCES:
         result[k] = dict(data.get(k, {}))
         result[k]["limits"] = [dict(x, reset_text=format_date(x["reset"]),

@@ -31,7 +31,9 @@ class LimitTest(unittest.TestCase):
         self.now = 1794211200.0
         paths = dict(ROOT=self.root, HOME=self.root, DATA=self.root / "data")
         for name, file in (("CACHE", "limits.json"), ("CLAUDE_CACHE", "claude-usage.json"),
-                          ("MODELS_FILE", "known-models.json"), ("LOCK", "refreshing")):
+                          ("MODELS_FILE", "known-models.json"), ("LOCK", "refreshing"),
+                          ("SETTINGS", "settings.json"), ("HELLO_STATE", "hello.json"),
+                          ("HELLO_LOG", "hello-log.jsonl")):
             paths[name] = paths["DATA"] / file
         for name, value in paths.items():
             self.patch_value(name, value)
@@ -758,19 +760,34 @@ class LimitTest(unittest.TestCase):
         finally:
             time.tzset()
 
-    def test_all_agy_call_sites_only_request_usage_or_models(self):
+    def test_all_agy_call_sites_only_request_usage_models_or_fixed_hello(self):
         tree = ast.parse(Path(m.__file__).read_text())
         calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                  and isinstance(node.func, ast.Name) and node.func.id == "run_agy"]
-        self.assertEqual(2, len(calls))
-        commands = [ast.literal_eval(call.args[0]) for call in calls]
+        self.assertEqual(3, len(calls))
+        commands = []
+        for call in calls:
+            command = call.args[0]
+            if any(isinstance(node, ast.Name) for node in ast.walk(command)):
+                self.assertEqual("send_hello", next(
+                    node.name for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and call in ast.walk(node)))
+                self.assertEqual("model", command.elts[3].id)
+                command.elts[3] = ast.Constant(value="test-model")
+            commands.append(ast.literal_eval(command))
         self.assertIn(["models"], commands)
         self.assertIn(["-p", "/usage", "--output-format", "json",
                        "--print-timeout", "60s"], commands)
+        self.assertIn(["-p", "hello", "--model", "test-model", "--output-format", "json",
+                       "--print-timeout", "60s"], commands)
 
-    def test_agy_rejects_prompt_commands_before_spawning(self):
+    def test_agy_rejects_arbitrary_or_incomplete_prompt_commands_before_spawning(self):
         for args in (["-p", "hello"], ["-p", "/usage", "--model", "x"], [],
-                     ["chat"], ["models", "--other"]):
+                     ["chat"], ["models", "--other"],
+                     ["-p", "another prompt", "--model", "x", "--output-format", "json",
+                      "--print-timeout", "60s"],
+                     ["-p", "hello", "--model", "x", "--output-format", "json",
+                      "--print-timeout", "60s", "--other"]):
             with self.subTest(args=args), self.assertRaises(ValueError):
                 m.run_agy(args, 1)
         self.popen.assert_not_called()
@@ -788,6 +805,202 @@ class LimitTest(unittest.TestCase):
             self.assertIn(flag, output.getvalue())
             self.assertIn(description, output.getvalue())
         self.popen.assert_not_called()
+
+    def hello_pair(self):
+        x = self.limit(source="Antigravity", name="Gemini Models", remaining=100,
+                       reset=self.now + 7 * 86400)
+        return x, dict(x, reset=x["reset"] - 600, data_time=self.now - 600)
+
+    def enable_hello(self):
+        self.write_json(m.SETTINGS, {"auto_hello": True})
+
+    def test_weekly_not_started_detection(self):
+        self.enable_hello()
+        x, old = self.hello_pair()
+        data = self.models(**{"flash-low": "X"})
+        cases = [
+            ("sliding", old, True),
+            ("fixed", dict(old, reset=x["reset"]), False),
+            ("fixed short interval", dict(old, reset=x["reset"],
+                                          data_time=self.now - 60), False),
+            ("first reset", dict(old, reset=x["reset"] - 7 * 86400), False),
+            ("previous 99", dict(old, remaining=99), False),
+            ("another group", dict(old, name="Gemini 4 Argon"), False),
+            ("short interval", dict(old, data_time=self.now - 59), False),
+            ("tolerance boundary", dict(old, reset=x["reset"] - 900), False),
+            ("exactly 60 seconds", dict(old, reset=x["reset"] - 60,
+                                        data_time=self.now - 60), True),
+            ("old schema", {"name": "Gemini Models", "remaining": 100}, False),
+            ("invalid", None, False),
+        ]
+        for name, previous, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(expected, m.weekly_not_started(x, previous))
+        for change in ({"remaining": 99}, {"window": "5-hour"}, {"source": "Codex"}):
+            self.assertFalse(m.weekly_not_started(dict(x, **change), old))
+        with patch.object(m, "run_agy", return_value="{}") as call:
+            for _, previous, expected in cases:
+                if not expected:
+                    m.send_hello([x], data, [previous])
+            m.send_hello([dict(x, remaining=99)], data, [old])
+            m.send_hello([x], data, [])
+            call.assert_not_called()
+            m.send_hello([x], data, [old])
+            call.assert_called_once()
+
+    def test_hello_model_selection_and_fallbacks(self):
+        data = self.models(**{"gemini-3.8-flash-low": "X", "other-flash-low": "Y",
+                              "argon-high": "Z", "argon-low": "A", "sonnet-low": "S",
+                              "gpt-oss-high": "G"})
+        self.assertEqual("gemini-3.8-flash-low", m.hello_model("Gemini Models", data))
+        self.assertEqual("argon-low", m.hello_model("Gemini 4 Argon", data))
+        self.assertEqual("gpt-oss-high", m.hello_model("Claude and GPT models", data))
+        del data["models"]["agy:gpt-oss-high"]
+        self.assertEqual("sonnet-low", m.hello_model("Claude and GPT models", data))
+        del data["models"]["agy:gemini-3.8-flash-low"]
+        self.assertEqual("other-flash-low", m.hello_model("Gemini Models", data))
+        self.assertIsNone(m.hello_model("Unknown", data))
+        for group, model in (("Gemini 4 Argon", "gemini-4-argon-low"),
+                             ("Claude and GPT models", "gpt-oss-120b-medium")):
+            data["models"]["agy:" + model] = "Preferred"
+            self.assertEqual(model, m.hello_model(group, data))
+        data["successful"] = []
+        self.assertIsNone(m.hello_model("Gemini Models", data))
+
+    def test_hello_cooldown_command_state_and_log(self):
+        self.enable_hello()
+        x, old = self.hello_pair()
+        data = self.models(**{"gemini-3.8-flash-low": "X"})
+        with patch.object(m, "run_agy", return_value="{}") as call:
+            m.send_hello([x, x], data, [old])
+            m.send_hello([x], data, [old])
+            call.assert_called_once_with(
+                ["-p", "hello", "--model", "gemini-3.8-flash-low",
+                 "--output-format", "json", "--print-timeout", "60s"], 90)
+            self.write_json(m.HELLO_STATE, {"Gemini Models": self.now - 21599})
+            m.send_hello([x], data, [old])
+            self.assertEqual(1, call.call_count)
+            self.write_json(m.HELLO_STATE, {"Gemini Models": self.now - 21600})
+            m.send_hello([x], data, [old])
+            self.assertEqual(2, call.call_count)
+        self.assertEqual({"Gemini Models": self.now}, m.read_json(m.HELLO_STATE))
+        self.assertEqual("sent", m.last_hello()["result"])
+        self.assertEqual(2, len(m.HELLO_LOG.read_text().splitlines()))
+        self.assertIn("Antigravity:\nLast automatic message: Gemini Models " +
+                      m.format_date(self.now) + " (gemini-3.8-flash-low, sent)",
+                      m.render_text({}))
+        self.assertNotIn("Last automatic message", m.menubar({}))
+        self.assertEqual(m.last_hello(), m.json_data({})["last_hello"])
+        self.write_json(m.SETTINGS, {"auto_hello": False})
+        self.assertIsNone(m.last_hello())
+        self.assertIsNone(m.json_data({})["last_hello"])
+        self.assertNotIn("Last automatic message", m.render_text({}))
+
+    def test_hello_invalid_state_no_model_and_error(self):
+        self.enable_hello()
+        x, old = self.hello_pair()
+        for state in ([], {"Gemini Models": None}, {"Gemini Models": "invalid"},
+                      {"Gemini Models": True}, {"Gemini Models": float("nan")}):
+            m.HELLO_STATE.write_text(json.dumps(state))
+            with patch.object(m, "run_agy", side_effect=RuntimeError) as call:
+                m.send_hello([x], self.models(), [old])
+                call.assert_not_called()
+                self.assertEqual("no model", m.last_hello()["result"])
+                m.send_hello([x], self.models(**{"flash-low": "X"}), [old])
+                self.assertEqual("error: RuntimeError", m.last_hello()["result"])
+        with m.HELLO_LOG.open("a") as file:
+            file.write('\n{\n[]\n{"time":null}\n')
+        self.assertEqual("error: RuntimeError", m.last_hello()["result"])
+
+    def test_hello_only_fresh_collection_and_under_lock(self):
+        self.enable_hello()
+        x, previous = self.hello_pair()
+        self.mock_collection(agy={"limits": [x]}, models=self.models(**{"flash-low": "X"}))
+
+        def check(*_):
+            self.assertTrue(m.LOCK.exists())
+            self.assertIsNotNone(m._lock)
+
+        with patch.object(m, "send_hello", side_effect=check) as send:
+            m.collect()
+            send.assert_called_once()
+            self.assertEqual([], send.call_args.args[2])
+            self.write_json(m.CACHE, self.data(agy={"limits": [previous]}))
+            m.collect()
+            self.assertEqual([previous], send.call_args.args[2])
+            m.agy_usage.return_value = {"error": "interrupted"}
+            send.reset_mock()
+            result = m.collect()
+            send.assert_not_called()
+            self.assertEqual("interrupted", result["agy"]["last_error"])
+            m.agy_usage.return_value = {"limits": [x]}
+            m.collect()
+            self.assertEqual([], send.call_args.args[2])
+            for error in ("error", "last_error"):
+                self.write_json(m.CACHE, self.data(agy={"limits": [previous], error: "failed"}))
+                m.collect()
+                self.assertEqual([], send.call_args.args[2])
+            send.reset_mock()
+            self.write_json(m.SETTINGS, {"auto_hello": False})
+            m.collect()
+            send.assert_not_called()
+        self.enable_hello()
+        with patch.object(m, "send_hello", side_effect=OSError):
+            self.assertIn("codex", m.collect())
+
+    def test_auto_hello_default_off_even_when_weekly_not_started(self):
+        x, previous = self.hello_pair()
+        self.write_json(m.CACHE, self.data(agy={"limits": [previous]}))
+        self.mock_collection(agy={"limits": [x]}, models=self.models(**{"flash-low": "X"}))
+        with patch.object(m, "run_agy") as call:
+            self.assertFalse(m.auto_hello_enabled())
+            m.collect()
+            m.send_hello([x], self.models(**{"flash-low": "X"}), [previous])
+            call.assert_not_called()
+        self.assertFalse(m.HELLO_STATE.exists())
+        self.assertFalse(m.HELLO_LOG.exists())
+        self.assertIsNone(m.json_data({})["last_hello"])
+        self.assertNotIn("Last automatic message", m.render_text({}))
+
+    def test_auto_hello_invalid_settings_are_silently_off(self):
+        x, previous = self.hello_pair()
+        self.mock_collection(agy={"limits": [x]}, models=self.models(**{"flash-low": "X"}))
+        m.DATA.mkdir(parents=True, exist_ok=True)
+        settings = ["{", "[]", "null", "true", "1", '\"true\"', "{}",
+                    '{"auto_hello": false}', '{"auto_hello": 1}', '{"auto_hello": 1.0}',
+                    '{"auto_hello": "true"}', '{"auto_hello": null}',
+                    '{"auto_hello": []}', '{"auto_hello": {}}',
+                    "[" * 2000 + "]" * 2000]
+        for raw in settings:
+            with self.subTest(raw=raw[:60]), patch.object(m, "run_agy") as call:
+                m.SETTINGS.write_text(raw)
+                self.write_json(m.CACHE, self.data(agy={"limits": [previous]}))
+                self.assertFalse(m.auto_hello_enabled())
+                m.collect()
+                call.assert_not_called()
+                self.assertFalse(m.HELLO_STATE.exists())
+                self.assertFalse(m.HELLO_LOG.exists())
+
+    def test_auto_hello_enabled_collection_sends(self):
+        x, previous = self.hello_pair()
+        self.mock_collection(agy={"limits": [x]}, models=self.models(**{"flash-low": "X"}))
+        self.write_json(m.CACHE, self.data(agy={"limits": [previous]}))
+        self.enable_hello()
+        with patch.object(m, "run_agy", return_value="{}") as call:
+            m.collect()
+            call.assert_called_once()
+        self.assertEqual("sent", m.last_hello()["result"])
+        self.assertTrue(m.HELLO_STATE.exists())
+        self.assertTrue(m.HELLO_LOG.exists())
+
+    def test_agy_accepts_exact_hello_command(self):
+        self.popen.side_effect = None
+        self.popen.return_value = Mock(returncode=0)
+        self.popen.return_value.communicate.return_value = ("{}", "")
+        args = ["-p", "hello", "--model", "flash-low", "--output-format", "json",
+                "--print-timeout", "60s"]
+        self.assertEqual("{}", m.run_agy(args, 90))
+        self.assertEqual([m.AGY] + args, self.popen.call_args.args[0])
 
     def test_line_length(self):
         for path in (Path(m.__file__), Path(__file__)):

@@ -2,7 +2,7 @@
 
 See how much of your Claude, Codex and Antigravity limits is left, in one place: terminal, JSON, or the macOS menu bar. It warns you when a weekly limit is about to reset with quota still unused, when a limit runs low, and when a new model appears.
 
-A single Python file with no dependencies. It never sends a prompt to any model.
+A single Python file with no dependencies. By default it never sends a prompt to any model.
 
 > Unofficial. Not affiliated with Anthropic, OpenAI or Google. It relies on local files and CLI output that are not stable public interfaces, so a tool update can break it.
 
@@ -83,12 +83,24 @@ Add this to `~/.claude/settings.json`, using your own path:
 
 `--short` only reads cached files and refreshes in the background, so it does not slow session start.
 
+## Automatic hello for Antigravity (optional, off by default)
+
+Antigravity's weekly counter appears to start only at a group's first message, so an unused window can sit idle. To have the tool start it for you, create `data/settings.json`:
+
+```json
+{"auto_hello": true}
+```
+
+When a group's weekly counter looks unstarted across two measurements, a background refresh sends it the single word `hello` with the cheapest available model, at most once per group every 6 hours. Attempts are logged to `data/hello-log.jsonl`.
+
+This is experimental. It uses a small amount of your quota, it also starts that group's 5-hour window, and the assumption about the weekly counter has not been confirmed.
+
 ## What it touches
 
 - Writes only to `data/` next to the script. Delete that folder to reset.
 - Reads the end of the five most recent Codex session files, and parses only lines containing `rate_limits`. Those logs hold your conversations, but only limit numbers are stored.
 - Reads Codex's model cache files. Honours `CODEX_HOME`.
-- Runs `agy` at most once every 30 minutes, only for `/usage` and `models`. Any other arguments are refused in code.
+- Runs `agy` only for `/usage` and `models`, at most once every 30 minutes unless you ask for `--refresh`. The optional automatic hello is the only other call allowed. Anything else is refused in code.
 - Makes no network requests itself. `agy` does its own.
 
 ## Tests
